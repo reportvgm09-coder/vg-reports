@@ -53,6 +53,9 @@ function loginForm(error, name) {
 // ---------- app pages (login required) ----------
 app.use(auth.requireLogin);
 app.use(require('./routes/reports'));
+app.use(require('./routes/payables'));
+app.use(require('./routes/registers'));
+app.use(require('./routes/orders'));
 app.use(require('./routes/upload'));
 app.use(require('./routes/settings'));
 

@@ -1,7 +1,9 @@
 const express = require('express');
 const { pool } = require('../db');
-const { receivables, collections, collectionTotal } = require('../reports');
-const { BUCKETS, todayIST, addDays } = require('../ageing');
+const { receivables, payables, collections, collectionTotal } = require('../reports');
+const orders = require('../orders');
+const ordersRoute = require('./orders');
+const { BUCKETS, todayIST, addDays, daysBetween } = require('../ageing');
 const { esc, rs, rsCell, dmy, layout, statusBadge, cleanPhone } = require('../views');
 const { sendCsv } = require('../csv');
 
@@ -62,28 +64,48 @@ function contactButtons(party, bills, asOf) {
 // ---------- dashboard ----------
 
 router.get('/', async (req, res) => {
-  const r = await receivables();
   const today = todayIST();
-  const thisMonth = await collectionTotal(monthStart(today), today);
+  const mStart = monthStart(today);
   const prev = prevMonthSamePeriod(today);
-  const lastMonth = await collectionTotal(prev.from, prev.to);
-  const last7 = await collectionTotal(addDays(today, -6), today);
+  const [r, pay, thisMonth, lastMonth, last7, salesNow, salesPrev, purchNow, ord] = await Promise.all([
+    receivables(), payables(),
+    collectionTotal(mStart, today), collectionTotal(prev.from, prev.to), collectionTotal(addDays(today, -6), today),
+    registerTotal('sales', mStart, today), registerTotal('sales', prev.from, prev.to), registerTotal('purchase', mStart, today),
+    pendingOrders(),
+  ]);
+  // Flags when the register stops short of today, so a low figure isn't misread.
+  const upto = (last) => (last && last < addDays(today, -2) ? `<br><span class="red-text">data only up to ${dmy(last)}</span>` : '');
+  const paySoon = pay.bills.filter((b) => b.status === 'overdue' || (b.status === 'not_due' && -b.overdue_days <= 15))
+    .reduce((a, b) => a + b.balance, 0);
+
+  const month = `
+  <h1>This month</h1>
+  <div class="kpis">
+    <div class="kpi"><span>Sales (before GST)</span><strong>${salesNow.any ? rs(salesNow.amount) : '–'}</strong>
+      <small>${salesNow.any ? `Last month same period ${rs(salesPrev.amount)}${upto(salesNow.last)}` : '<a href="/upload">upload sales register</a>'}</small></div>
+    <div class="kpi"><span>Collected</span><strong>${rs(thisMonth.total)}</strong><small>Last month same period ${rs(lastMonth.total)}</small></div>
+    <div class="kpi"><span>Purchase (before GST)</span><strong>${purchNow.any ? rs(purchNow.amount) : '–'}</strong>
+      <small>${purchNow.any ? `<a href="/purchase">see purchases</a>${upto(purchNow.last)}` : '<a href="/upload">upload purchase register</a>'}</small></div>
+    <div class="kpi amber"><span>To pay suppliers in 15 days</span><strong>${pay.upload ? rs(paySoon) : '–'}</strong>
+      <small>${pay.upload ? `incl. past due · <a href="/payables/bills?status=soon">bills</a>` : '<a href="/upload">upload creditors file</a>'}</small></div>
+    ${ord ? `<div class="kpi"><span>Orders pending dispatch</span><strong>${rs(ord.value)}</strong><small>${ord.qty.toLocaleString('en-IN')} pieces · <a href="/orders">orders</a></small></div>` : ''}
+  </div>`;
 
   if (!r.upload) {
-    return res.send(layout({ title: 'Dashboard', user: req.user, active: '/', body: noDataNotice() }));
+    return res.send(layout({ title: 'Dashboard', user: req.user, active: '/', body: month + noDataNotice() }));
   }
   const t = r.totals;
   const overduePct = t.total > 0 ? Math.round((t.overdue / t.total) * 100) : 0;
   const top = r.parties.filter((p) => p.overdue > 0).slice(0, 10);
 
-  const body = `
+  const body = `${month}
   <h1>Receivables</h1>
   ${freshness(r.upload)}
   <div class="kpis">
     <div class="kpi"><span>Total receivable</span><strong>${rs(t.total)}</strong><small>${t.parties} buyers</small></div>
     <div class="kpi red"><span>Overdue</span><strong>${rs(t.overdue)}</strong><small>${overduePct}% · ${t.overdue_parties} buyers</small></div>
     <div class="kpi"><span>Not yet due</span><strong>${rs(t.not_due)}</strong><small>within credit period</small></div>
-    <div class="kpi"><span>Collected this month</span><strong>${rs(thisMonth.total)}</strong><small>Last month same period ${rs(lastMonth.total)}</small></div>
+    <div class="kpi"><span>Collected, last 7 days</span><strong>${rs(last7.total)}</strong><small>${last7.n} receipts · <a href="/collections">all</a></small></div>
   </div>
   ${t.advance < 0 ? `<p class="note">Advances / unadjusted payments sitting on account: <strong>${rs(t.advance)}</strong> (already netted in the totals above).</p>` : ''}
   ${t.over_limit ? `<p class="note warn"><a href="/outstanding?show=overlimit">${t.over_limit} buyer(s) are over their credit limit →</a></p>` : ''}
@@ -91,28 +113,43 @@ router.get('/', async (req, res) => {
   <div class="grid2">
     <section class="card">
       <h2>Age of pending bills</h2>
-      <p class="muted">Days since bill date. Click a row for the bills.</p>
+      <p class="muted">Days since bill date. Click an amount for the bills.</p>
       ${bucketBars(t)}
     </section>
     <section class="card">
-      <h2>Collections, last 7 days</h2>
-      <p class="big">${rs(last7.total)}</p>
-      <p class="muted">${last7.n} receipts · <a href="/collections">see all collections</a></p>
+      <div class="card-head"><h2>Top overdue buyers</h2><a href="/followup">Follow-up list →</a></div>
+      ${top.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>Buyer</th><th class="num">Overdue</th><th class="num">Most overdue</th></tr></thead>
+        <tbody>${top.map((p) => `<tr>
+          <td><a href="/party/${encodeURIComponent(p.party_key)}">${esc(p.party_name)}</a>${p.over_limit ? ' <span class="badge red">over limit</span>' : ''}</td>
+          <td class="num red-text">${rs(p.overdue)}</td><td class="num">${p.max_overdue_days} days</td></tr>`).join('')}</tbody>
+      </table></div>` : '<p>Nothing overdue.</p>'}
     </section>
-  </div>
-
-  <section class="card">
-    <div class="card-head"><h2>Top overdue buyers</h2><a href="/followup">Full follow-up list →</a></div>
-    ${top.length ? `<div class="table-wrap"><table>
-      <thead><tr><th>Buyer</th><th class="num">Overdue</th><th class="num">Total pending</th><th class="num">Most overdue</th><th>Salesman</th></tr></thead>
-      <tbody>${top.map((p) => `<tr>
-        <td><a href="/party/${encodeURIComponent(p.party_key)}">${esc(p.party_name)}</a>${p.over_limit ? ' <span class="badge red">over limit</span>' : ''}</td>
-        <td class="num red-text">${rs(p.overdue)}</td><td class="num">${rs(p.total)}</td>
-        <td class="num">${p.max_overdue_days} days</td><td>${esc(p.salesman)}</td></tr>`).join('')}</tbody>
-    </table></div>` : '<p>Nothing overdue. 🎉</p>'}
-  </section>`;
+  </div>`;
   res.send(layout({ title: 'Dashboard', user: req.user, active: '/', body }));
 });
+
+/** Period total; `any` says whether this register was ever uploaded. */
+async function registerTotal(register, from, to) {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(SUM(amount) FILTER (WHERE bill_date BETWEEN $2 AND $3),0)::float AS amount,
+            COUNT(*) FILTER (WHERE bill_date BETWEEN $2 AND $3)::int AS n,
+            COUNT(*) > 0 AS any, MAX(bill_date) AS last
+       FROM register_lines WHERE register = $1`, [register, from, to]);
+  return rows[0];
+}
+
+/** Pending order value for the dashboard; quietly null if orders aren't connected or reachable. */
+async function pendingOrders() {
+  if (!orders.configured()) return null;
+  try {
+    const { rows } = await ordersRoute.loadRows();
+    return rows.reduce((a, x) => ({ value: a.value + x.pending_value, qty: a.qty + x.pending_qty }), { value: 0, qty: 0 });
+  } catch (e) {
+    console.error('dashboard orders:', e.message);
+    return null;
+  }
+}
 
 // ---------- follow-up list ----------
 
@@ -190,7 +227,8 @@ router.get('/outstanding', async (req, res) => {
   const salesmen = [...new Set(r.parties.map((p) => p.salesman).filter(Boolean))].sort();
   const sum = (k) => list.reduce((a, p) => a + p[k], 0);
   const body = `
-  <h1>Party-wise outstanding</h1>
+  <h1>Receivables: party-wise</h1>
+  <nav class="tabs"><a class="on" href="/outstanding">Party-wise</a><a href="/bills">Bill-wise ageing</a></nav>
   ${freshness(r.upload)}
   <form class="filters" method="get">
     <input name="q" placeholder="Search buyer" value="${esc(req.query.q || '')}">
@@ -226,7 +264,7 @@ function round(n) { return Math.round(Number(n || 0)); }
 
 router.get('/bills', async (req, res) => {
   const r = await receivables();
-  if (!r.upload) return res.send(layout({ title: 'Bill ageing', user: req.user, active: '/bills', body: noDataNotice() }));
+  if (!r.upload) return res.send(layout({ title: 'Bill ageing', user: req.user, active: '/outstanding', body: noDataNotice() }));
   const bucket = String(req.query.bucket || '');
   const status = String(req.query.status || '');
   const q = String(req.query.q || '').trim().toUpperCase();
@@ -243,7 +281,8 @@ router.get('/bills', async (req, res) => {
   }
   const total = list.reduce((a, b) => a + b.balance, 0);
   const body = `
-  <h1>Bill-wise ageing</h1>
+  <h1>Receivables: bill-wise ageing</h1>
+  <nav class="tabs"><a href="/outstanding">Party-wise</a><a class="on" href="/bills">Bill-wise ageing</a></nav>
   ${freshness(r.upload)}
   <form class="filters" method="get">
     <input name="q" placeholder="Buyer or bill no." value="${esc(req.query.q || '')}">
@@ -268,7 +307,7 @@ router.get('/bills', async (req, res) => {
       <td class="num">${b.age ?? ''}</td><td>${dmy(b.due_date)}</td>
       <td>${statusBadge(b.status, b.overdue_days)}</td></tr>`).join('')}</tbody>
   </table></div>`;
-  res.send(layout({ title: 'Bill ageing', user: req.user, active: '/bills', body }));
+  res.send(layout({ title: 'Bill ageing', user: req.user, active: '/outstanding', body }));
 });
 
 // ---------- one buyer ----------
@@ -285,6 +324,21 @@ router.get('/party/:key', async (req, res) => {
     'SELECT * FROM receipts WHERE party_key = $1 ORDER BY receipt_date DESC, id DESC LIMIT 25', [key]);
   const name = (info && info.display_name) || summary.party_name;
   const p = summary || { party_key: key, party_name: name, total: 0, overdue: 0, not_due: 0, phone: info.phone };
+  const today = todayIST();
+  const { rows: brandSales } = await pool.query(
+    `SELECT brand, SUM(amount)::float AS amount, SUM(qty)::float AS qty, MAX(bill_date) AS last
+       FROM register_lines WHERE register = 'sales' AND party_key = $1 AND bill_date > $2::date - 365
+      GROUP BY brand ORDER BY amount DESC`, [key, today]);
+  const { rows: lastSaleRows } = await pool.query(
+    `SELECT MAX(bill_date) AS last FROM register_lines WHERE register = 'sales' AND party_key = $1`, [key]);
+  const lastSale = lastSaleRows[0].last;
+  const yearSales = brandSales.reduce((a, b) => a + b.amount, 0);
+  let pendingOrd = null;
+  if (orders.configured()) {
+    try {
+      pendingOrd = (await ordersRoute.loadRows()).rows.filter((o) => o.party_key === key && o.pending_qty > 0);
+    } catch (e) { console.error('buyer page orders:', e.message); }
+  }
 
   const body = `
   <p><a href="/outstanding">← All buyers</a></p>
@@ -313,6 +367,22 @@ router.get('/party/:key', async (req, res) => {
     <tbody>${rcpts.map((x) => `<tr><td>${dmy(x.receipt_date)}</td><td>${esc(x.voucher_no)}</td><td class="num">${rs(x.amount)}</td><td>${esc(x.mode)}</td><td class="muted">${esc(x.narration)}</td></tr>`).join('')}</tbody>
   </table></div>` : '<p class="muted">No payments in uploaded receipt files.</p>'}
   </section>
+
+  ${brandSales.length ? `<section class="card"><h2>What they buy (last 12 months)</h2>
+  <p class="muted">${rs(yearSales)} before GST${lastSale ? ` · last bill ${dmy(lastSale)}, ${daysBetween(lastSale, today)} days ago` : ''} · <a href="/sales?party=${encodeURIComponent(key)}&from=${addDays(today, -364)}&to=${today}">all sales</a></p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Brand</th><th class="num">Pieces</th><th class="num">Value</th><th class="num">Share</th><th>Last bought</th></tr></thead>
+    <tbody>${brandSales.map((b) => `<tr><td>${esc(b.brand || '(no brand)')}</td><td class="num">${b.qty ? Math.round(b.qty) : ''}</td>
+      <td class="num">${rs(b.amount)}</td><td class="num">${yearSales ? Math.round((b.amount / yearSales) * 100) : 0}%</td><td>${dmy(b.last)}</td></tr>`).join('')}</tbody>
+  </table></div></section>` : ''}
+
+  ${pendingOrd && pendingOrd.length ? `<section class="card"><h2>Orders still to dispatch</h2>
+  <p class="muted">From the Sales Order app · ${rs(pendingOrd.reduce((a, o) => a + o.pending_value, 0))} pending</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Order</th><th>Date</th><th>Brand</th><th>Season</th><th class="num">Ordered</th><th class="num">Pending</th><th class="num">Pending value</th></tr></thead>
+    <tbody>${pendingOrd.map((o) => `<tr><td>${esc(o.order_id)}${o.state === 'hold' ? ' <span class="badge amber">on hold</span>' : ''}</td><td>${dmy(o.order_date)}</td><td>${esc(o.brand)}</td><td>${esc(o.season || '')}</td>
+      <td class="num">${Math.round(o.ordered_qty)}</td><td class="num"><strong>${Math.round(o.pending_qty)}</strong></td><td class="num">${rs(o.pending_value)}</td></tr>`).join('')}</tbody>
+  </table></div></section>` : ''}
 
   <section class="card" id="edit"><h2>Buyer settings</h2>
   <form method="post" action="/party/${encodeURIComponent(key)}" class="form-grid">

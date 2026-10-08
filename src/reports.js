@@ -2,33 +2,45 @@
 const { pool, getSetting } = require('./db');
 const { ageBill, summarizeParties, totals, todayIST } = require('./ageing');
 
-async function defaultCreditDays() {
-  const v = parseInt(await getSetting('default_credit_days', '60'), 10);
-  return Number.isFinite(v) && v >= 0 ? v : 60;
+// The two sides share one engine: buyers owe us (receivables, 'outstanding'
+// uploads, parties table) and we owe suppliers (payables, vendors table).
+const SIDES = {
+  receivable: { kind: 'outstanding', table: 'parties', setting: 'default_credit_days', fallback: 60 },
+  payable: { kind: 'payables', table: 'vendors', setting: 'default_vendor_credit_days', fallback: 120 },
+};
+
+async function defaultCreditDays(side = 'receivable') {
+  const s = SIDES[side];
+  const v = parseInt(await getSetting(s.setting, String(s.fallback)), 10);
+  return Number.isFinite(v) && v >= 0 ? v : s.fallback;
 }
 
-async function latestOutstandingUpload() {
+async function latestOutstandingUpload(side = 'receivable') {
   const { rows } = await pool.query(
-    `SELECT * FROM uploads WHERE kind = 'outstanding' ORDER BY id DESC LIMIT 1`);
+    'SELECT * FROM uploads WHERE kind = $1 ORDER BY id DESC LIMIT 1', [SIDES[side].kind]);
   return rows[0] || null;
 }
 
-async function partyInfoMap() {
-  const { rows } = await pool.query('SELECT * FROM parties');
+async function partyInfoMap(side = 'receivable') {
+  const { rows } = await pool.query(`SELECT * FROM ${SIDES[side].table}`);
   return new Map(rows.map((r) => [r.party_key, r]));
 }
 
+/** Supplier dues, same shape as receivables(). */
+function payables() { return outstanding('payable'); }
+function receivables() { return outstanding('receivable'); }
+
 /**
- * Latest outstanding snapshot, every bill aged as of today.
+ * Latest outstanding snapshot for one side, every bill aged as of today.
  * Returns { upload, asOf, bills, parties, totals, defaultDays }.
  */
-async function receivables() {
-  const upload = await latestOutstandingUpload();
-  const defaultDays = await defaultCreditDays();
+async function outstanding(side) {
+  const upload = await latestOutstandingUpload(side);
+  const defaultDays = await defaultCreditDays(side);
   const asOf = todayIST();
   if (!upload) return { upload: null, asOf, bills: [], parties: [], totals: totals([]), defaultDays };
 
-  const info = await partyInfoMap();
+  const info = await partyInfoMap(side);
   const { rows } = await pool.query(
     `SELECT party_key, party_name, bill_no, bill_date, bill_amount, balance, marg_due_date
        FROM outstanding_bills WHERE upload_id = $1
@@ -61,15 +73,18 @@ async function collectionTotal(from, to) {
   return rows[0];
 }
 
-/** Make sure every party seen in uploads has a row in parties (for settings). */
-async function ensureParties(records) {
+/** Make sure every party seen in uploads has a row (for settings). */
+async function ensureParties(records, side = 'receivable') {
   const seen = new Map();
   for (const r of records) if (!seen.has(r.party_key)) seen.set(r.party_key, r.party_name);
-  for (const [key, name] of seen) {
-    await pool.query(
-      `INSERT INTO parties (party_key, display_name) VALUES ($1, $2)
-       ON CONFLICT (party_key) DO NOTHING`, [key, name]);
-  }
+  if (!seen.size) return;
+  await pool.query(
+    `INSERT INTO ${SIDES[side].table} (party_key, display_name)
+     SELECT * FROM unnest($1::text[], $2::text[]) ON CONFLICT (party_key) DO NOTHING`,
+    [[...seen.keys()], [...seen.values()]]);
 }
 
-module.exports = { receivables, collections, collectionTotal, ensureParties, defaultCreditDays, latestOutstandingUpload };
+module.exports = {
+  receivables, payables, outstanding, collections, collectionTotal, ensureParties,
+  defaultCreditDays, latestOutstandingUpload, partyInfoMap, SIDES,
+};

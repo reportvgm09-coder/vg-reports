@@ -20,6 +20,12 @@ services:
         generateValue: true
       - key: APP_USERS          # e.g. owner:StrongPass1,accounts:StrongPass2
         sync: false
+      # Orders page: a READ-ONLY MongoDB Atlas user's connection string for the
+      # Sales Order app's database (see README). Leave empty to hide orders.
+      - key: ORDERS_MONGO_URL
+        sync: false
+      - key: ORDERS_DB_NAME
+        value: sale_order_db
 
 databases:
   - name: vg-reports-db

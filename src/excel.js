@@ -35,6 +35,42 @@ const FIELDS = {
   ],
 };
 
+const SUPPLIER_ALIASES = ['supplier name', 'supplier', 'vendor name', 'vendor', 'party name', 'party', 'account name', 'ledger name', 'ledger', 'name of party'];
+
+// Creditors outstanding: same shape as debtors, supplier names instead.
+FIELDS.payables = FIELDS.outstanding.map((f) =>
+  (f.key === 'party' ? { ...f, label: 'Supplier name', aliases: SUPPLIER_ALIASES } : f));
+
+// Item-wise sales / purchase registers. In Marg the brand is usually the
+// "Company" column. Rows without a date or bill no. inherit them from the
+// bill heading line above (Marg's grouped layout).
+function registerFields(partyLabel, partyAliases) {
+  return [
+    { key: 'date', label: 'Bill date', required: true,
+      aliases: ['bill date', 'invoice date', 'inv date', 'vch date', 'voucher date', 'date'] },
+    { key: 'bill_no', label: 'Bill no.', required: false,
+      aliases: ['bill no', 'bill number', 'invoice no', 'inv no', 'voucher no', 'vch no', 'ref no', 'bill'] },
+    { key: 'party', label: partyLabel, required: false, aliases: partyAliases },
+    { key: 'item', label: 'Item / product', required: false,
+      aliases: ['item name', 'product name', 'item', 'product', 'description', 'particulars', 'item description'] },
+    { key: 'brand', label: 'Brand / company', required: false,
+      aliases: ['brand', 'brand name', 'company', 'company name', 'mfg', 'manufacturer', 'mfr', 'comp'] },
+    { key: 'qty', label: 'Qty', required: false,
+      aliases: ['qty', 'quantity', 'pcs', 'qty pcs', 'nos', 'billed qty'] },
+    { key: 'mrp', label: 'MRP', required: false, aliases: ['mrp', 'm r p'] },
+    { key: 'rate', label: 'Rate', required: false, aliases: ['rate', 'sale rate', 'purchase rate', 'pur rate', 'net rate'] },
+    { key: 'amount', label: 'Value before GST', required: true,
+      aliases: ['taxable amount', 'taxable value', 'taxable amt', 'taxable', 'gross amount', 'goods value', 'amount', 'value'] },
+    { key: 'tax', label: 'GST amount', required: false,
+      aliases: ['gst amount', 'gst amt', 'tax amount', 'tax amt', 'total tax', 'gst', 'tax'] },
+    { key: 'total', label: 'Total with GST', required: false,
+      aliases: ['net amount', 'net amt', 'bill amount', 'total amount', 'grand total', 'net value', 'total', 'net'] },
+  ];
+}
+FIELDS.sales = registerFields('Buyer (party) name',
+  ['party name', 'party', 'customer name', 'customer', 'buyer', 'account name', 'ledger name', 'name of party']);
+FIELDS.purchase = registerFields('Supplier name', SUPPLIER_ALIASES);
+
 function normHeader(v) {
   return String(v ?? '')
     .toLowerCase()
@@ -157,8 +193,10 @@ const TOTAL_RE = /\b(total|grand total|sub total|subtotal|opening|closing)\b/i;
  * grouped layout is assumed: a party heading row followed by its bills.
  */
 function extractRecords(rows, kind, mapping, headerRow) {
-  const dateKey = kind === 'outstanding' ? 'bill_date' : 'date';
-  const amtKey = kind === 'outstanding' ? 'balance' : 'amount';
+  if (kind === 'sales' || kind === 'purchase') return extractLines(rows, mapping, headerRow);
+  const billWise = kind === 'outstanding' || kind === 'payables';
+  const dateKey = billWise ? 'bill_date' : 'date';
+  const amtKey = billWise ? 'balance' : 'amount';
   const records = [];
   const skipped = [];
   let currentParty = '';
@@ -171,7 +209,14 @@ function extractRecords(rows, kind, mapping, headerRow) {
 
     const get = (k) => (mapping[k] === undefined || mapping[k] < 0 ? '' : row[mapping[k]]);
     const date = parseDate(get(dateKey));
-    const amount = parseAmount(get(amtKey));
+    let amount = parseAmount(get(amtKey));
+    // For suppliers Marg marks what we owe as "Cr": that is a normal payable.
+    // "Dr" on a supplier means we paid in advance, so it counts against us.
+    if (kind === 'payables' && amount !== null) {
+      const side = drCr(get(amtKey));
+      if (side === 'cr') amount = Math.abs(amount);
+      else if (side === 'dr') amount = -Math.abs(amount);
+    }
     const partyCell = cleanText(get('party'));
 
     if (TOTAL_RE.test(rowText) && !date) continue; // total / opening lines
@@ -192,7 +237,7 @@ function extractRecords(rows, kind, mapping, headerRow) {
     }
     if (amount === 0) continue;
 
-    if (kind === 'outstanding') {
+    if (billWise) {
       records.push({
         party_name: party,
         party_key: partyKey(party),
@@ -217,7 +262,83 @@ function extractRecords(rows, kind, mapping, headerRow) {
   return { records, skipped };
 }
 
+/** 'dr' / 'cr' if the cell carries that suffix, else null. */
+function drCr(v) {
+  if (typeof v !== 'string') return null;
+  const s = v.trim();
+  if (/cr\.?$/i.test(s)) return 'cr';
+  if (/dr\.?$/i.test(s)) return 'dr';
+  return null;
+}
+
+/**
+ * Item-wise register rows. Two layouts are handled:
+ *  - flat: every row has date, bill no., party and the item;
+ *  - grouped: a bill heading line (date / bill no. / party) followed by item
+ *    lines that leave those blank. Item lines inherit from the heading.
+ * When no item or brand column is mapped, each dated row is one bill line.
+ */
+function extractLines(rows, mapping, headerRow) {
+  const records = [];
+  const skipped = [];
+  const itemWise = mapping.item !== undefined || mapping.brand !== undefined;
+  let ctx = { date: null, bill_no: '', party: '' };
+
+  for (let r = headerRow + 1; r < rows.length; r++) {
+    const row = rows[r];
+    const cells = row.map(cleanText);
+    if (cells.every((c) => c === '')) continue;
+    const get = (k) => (mapping[k] === undefined || mapping[k] < 0 ? '' : row[mapping[k]]);
+
+    const date = parseDate(get('date'));
+    const billNo = cleanText(get('bill_no'));
+    const party = cleanText(get('party'));
+    const item = cleanText(get('item'));
+    const brand = cleanText(get('brand'));
+    const amount = parseAmount(get('amount'));
+    const rowText = cells.join(' ');
+
+    // Whatever the row carries replaces the running bill details; blanks
+    // inherit from the bill heading above.
+    if (date) ctx.date = date;
+    if (billNo) ctx.bill_no = billNo;
+    if (party && !TOTAL_RE.test(party)) ctx.party = party;
+
+    if (TOTAL_RE.test(rowText) && !item && !brand) continue;
+    if (TOTAL_RE.test(item) || TOTAL_RE.test(brand)) continue;
+
+    const isLine = itemWise ? (item || brand) && amount !== null : (date || ctx.date) && amount !== null;
+    if (!isLine) {
+      // Heading line of a grouped bill, or a party heading with no date.
+      if (!date && !billNo && !party && mapping.party === undefined) {
+        const firstText = cells.find((c) => c && parseAmount(c) === null && !parseDate(c));
+        if (firstText && !TOTAL_RE.test(firstText)) ctx.party = firstText;
+      }
+      continue;
+    }
+    if (!ctx.date) { skipped.push({ row: r + 1, reason: 'no valid date' }); continue; }
+    if (!ctx.party) { skipped.push({ row: r + 1, reason: 'no party' }); continue; }
+    if (amount === 0) continue;
+
+    records.push({
+      bill_date: ctx.date,
+      bill_no: ctx.bill_no,
+      party_name: ctx.party,
+      party_key: partyKey(ctx.party),
+      item,
+      brand: brand.toUpperCase(),
+      qty: parseAmount(get('qty')),
+      mrp: parseAmount(get('mrp')),
+      rate: parseAmount(get('rate')),
+      amount,
+      tax: parseAmount(get('tax')),
+      total: parseAmount(get('total')),
+    });
+  }
+  return { records, skipped };
+}
+
 module.exports = {
-  FIELDS, readRows, detectHeader, extractRecords,
-  parseDate, parseAmount, partyKey, normHeader,
+  FIELDS, readRows, detectHeader, extractRecords, extractLines,
+  parseDate, parseAmount, partyKey, normHeader, drCr,
 };

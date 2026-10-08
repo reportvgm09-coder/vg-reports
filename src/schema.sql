@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS parties (
 -- Every file uploaded, kept for history.
 CREATE TABLE IF NOT EXISTS uploads (
   id            SERIAL PRIMARY KEY,
-  kind          TEXT NOT NULL,     -- 'outstanding' | 'receipts'
+  kind          TEXT NOT NULL,     -- 'outstanding' | 'receipts' | 'payables' | 'sales' | 'purchase'
   filename      TEXT NOT NULL,
   as_of_date    DATE NOT NULL,
   rows_imported INTEGER NOT NULL DEFAULT 0,
@@ -72,3 +72,47 @@ CREATE TABLE IF NOT EXISTS receipts (
 );
 CREATE INDEX IF NOT EXISTS idx_rc_date  ON receipts(receipt_date);
 CREATE INDEX IF NOT EXISTS idx_rc_party ON receipts(party_key);
+
+-- Vendors / suppliers, the payables side of parties.
+INSERT INTO settings (key, value) VALUES ('default_vendor_credit_days', '120')
+  ON CONFLICT (key) DO NOTHING;
+CREATE TABLE IF NOT EXISTS vendors (
+  party_key     TEXT PRIMARY KEY,
+  display_name  TEXT NOT NULL,
+  credit_days   INTEGER,          -- NULL = use default_vendor_credit_days
+  phone         TEXT,
+  notes         TEXT,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Payables reuse outstanding_bills: rows belong to an upload of kind 'payables'.
+
+-- Item-wise sales and purchase registers from Marg. A new upload replaces
+-- every line of the same register dated inside the file's date range, so
+-- bills edited or deleted in Marg are corrected on the next upload.
+CREATE TABLE IF NOT EXISTS register_lines (
+  id          BIGSERIAL PRIMARY KEY,
+  register    TEXT NOT NULL,        -- 'sales' | 'purchase'
+  upload_id   INTEGER REFERENCES uploads(id) ON DELETE SET NULL,
+  bill_date   DATE NOT NULL,
+  bill_no     TEXT NOT NULL DEFAULT '',
+  party_key   TEXT NOT NULL,
+  party_name  TEXT NOT NULL,
+  item        TEXT NOT NULL DEFAULT '',
+  brand       TEXT NOT NULL DEFAULT '',
+  qty         NUMERIC(14,3),
+  mrp         NUMERIC(14,2),
+  rate        NUMERIC(14,2),
+  amount      NUMERIC(14,2) NOT NULL,  -- line value before GST
+  tax         NUMERIC(14,2),
+  total       NUMERIC(14,2)
+);
+CREATE INDEX IF NOT EXISTS idx_rl_reg_date  ON register_lines(register, bill_date);
+CREATE INDEX IF NOT EXISTS idx_rl_reg_party ON register_lines(register, party_key);
+CREATE INDEX IF NOT EXISTS idx_rl_reg_brand ON register_lines(register, brand);
+
+-- Manual link between a Sales Order app customer and a Marg buyer, for names
+-- that don't match automatically.
+CREATE TABLE IF NOT EXISTS order_customer_links (
+  order_customer_id TEXT PRIMARY KEY,
+  party_key         TEXT NOT NULL
+);

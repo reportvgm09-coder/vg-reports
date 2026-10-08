@@ -14,21 +14,36 @@ const upload = multer({
 });
 
 const KINDS = {
-  outstanding: { label: 'Bill-wise outstanding (receivables)', hint: 'Marg → Outstanding → Bill-wise outstanding of debtors → export to Excel. Upload the full list every day; it replaces yesterday’s.' },
-  receipts: { label: 'Receipts / collections', hint: 'Marg receipt register (or cash/bank book receipts) for the last few days. Overlapping days are fine; duplicates are skipped.' },
+  outstanding: { label: 'Buyers’ outstanding (receivables)', noun: 'bills', group: 'Daily',
+    hint: 'Marg → bill-wise outstanding of debtors → Excel. Upload the full list; it replaces the previous one.' },
+  receipts: { label: 'Receipts / collections', noun: 'receipts', group: 'Daily',
+    hint: 'Marg receipt register for the last few days. Overlapping days are fine; duplicates are skipped.' },
+  sales: { label: 'Sales register (item-wise)', noun: 'item lines', group: 'Daily',
+    hint: 'Marg item-wise sale register for any date range. It replaces sales already uploaded for those dates.' },
+  purchase: { label: 'Purchase register (item-wise)', noun: 'item lines', group: 'Weekly or daily',
+    hint: 'Marg item-wise purchase register for any date range. It replaces purchases already uploaded for those dates.' },
+  payables: { label: 'Suppliers’ outstanding (payables)', noun: 'bills', group: 'Weekly or daily',
+    hint: 'Marg → bill-wise outstanding of creditors → Excel. Upload the full list; it replaces the previous one.' },
 };
+const SNAPSHOT_KINDS = { outstanding: 'receivable', payables: 'payable' };
+const REGISTER_KINDS = ['sales', 'purchase'];
 
 const KEEP_SNAPSHOT_DAYS = 90;
 
 router.get('/upload', async (req, res) => {
   const { rows: recent } = await pool.query('SELECT * FROM uploads ORDER BY id DESC LIMIT 15');
+  const { rows: lastRows } = await pool.query(
+    'SELECT DISTINCT ON (kind) kind, uploaded_at FROM uploads ORDER BY kind, id DESC');
+  const last = new Map(lastRows.map((x) => [x.kind, x.uploaded_at]));
+  const when = (d) => new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
   const body = `
   <h1>Upload Marg files</h1>
   <div class="grid2">
   ${Object.entries(KINDS).map(([kind, k]) => `
     <section class="card">
-      <h2>${k.label}</h2>
+      <h2>${k.label} <span class="badge grey">${k.group}</span></h2>
       <p class="muted">${k.hint}</p>
+      <p class="fresh">${last.has(kind) ? `Last uploaded ${esc(when(last.get(kind)))}` : 'Never uploaded'}</p>
       <form method="post" action="/upload" enctype="multipart/form-data" class="stack">
         <input type="hidden" name="kind" value="${kind}">
         <input type="file" name="file" accept=".xlsx,.xls,.csv" required>
@@ -118,10 +133,12 @@ router.get('/upload/:id', async (req, res) => {
   const headers = rows[headerRow] || [];
   const { records, skipped } = extractRecords(rows, kind, mapping, headerRow);
   const missing = FIELDS[kind].filter((f) => f.required && mapping[f.key] === undefined);
-  const total = records.reduce((a, r) => a + (kind === 'outstanding' ? r.balance : r.amount), 0);
+  const total = records.reduce((a, r) => a + (r.balance ?? r.amount), 0);
   const parties = new Set(records.map((r) => r.party_key)).size;
+  const who = kind === 'payables' || kind === 'purchase' ? 'suppliers' : 'buyers';
   const groupedNote = mapping.party === undefined
-    ? '<p class="note">No party column chosen, so party names are taken from the heading line above each group of bills (Marg’s grouped layout).</p>' : '';
+    ? '<p class="note">No party column chosen, so names are taken from the heading line above each group (Marg’s grouped layout).</p>' : '';
+  const range = REGISTER_KINDS.includes(kind) && records.length ? dateRange(records) : null;
 
   const colOptions = (sel) => `<option value="-1">— not in file —</option>` +
     headers.map((h, i) => `<option value="${i}" ${sel === i ? 'selected' : ''}>${esc(colLetter(i))}: ${esc(String(h).slice(0, 40) || '(blank)')}</option>`).join('');
@@ -144,24 +161,46 @@ router.get('/upload/:id', async (req, res) => {
   ${missing.length ? `<div class="flash error">Choose a column for: ${missing.map((f) => esc(f.label)).join(', ')}</div>` : ''}
   <section class="card">
     <h2>Preview</h2>
-    <p><strong>${records.length}</strong> ${kind === 'outstanding' ? 'bills' : 'receipts'} from <strong>${parties}</strong> buyers, total <strong>${rs(total)}</strong>${skipped.length ? ` · <span class="red-text">${skipped.length} rows skipped</span>` : ''}</p>
-    ${preview.length ? `<div class="table-wrap"><table>${kind === 'outstanding'
-      ? `<thead><tr><th>Buyer</th><th>Bill no.</th><th>Bill date</th><th class="num">Bill amt</th><th class="num">Pending</th></tr></thead>
-         <tbody>${preview.map((r) => `<tr><td>${esc(r.party_name)}</td><td>${esc(r.bill_no)}</td><td>${dmy(r.bill_date)}</td><td class="num">${r.bill_amount !== null ? rs(r.bill_amount) : ''}</td><td class="num">${rs(r.balance)}</td></tr>`).join('')}</tbody>`
-      : `<thead><tr><th>Date</th><th>Buyer</th><th>Voucher</th><th class="num">Amount</th><th>Mode</th></tr></thead>
-         <tbody>${preview.map((r) => `<tr><td>${dmy(r.receipt_date)}</td><td>${esc(r.party_name)}</td><td>${esc(r.voucher_no)}</td><td class="num">${rs(r.amount)}</td><td>${esc(r.mode)}</td></tr>`).join('')}</tbody>`}
-    </table></div>` : '<p class="muted">Nothing recognised yet. Fix the header row or columns above.</p>'}
+    <p><strong>${records.length}</strong> ${KINDS[kind].noun} from <strong>${parties}</strong> ${who}, total <strong>${rs(total)}</strong>${range ? `, dated ${dmy(range.from)} to ${dmy(range.to)}` : ''}${skipped.length ? ` · <span class="red-text">${skipped.length} rows skipped</span>` : ''}</p>
+    ${preview.length ? `<div class="table-wrap"><table>${previewTable(kind, preview)}</table></div>` : '<p class="muted">Nothing recognised yet. Fix the header row or columns above.</p>'}
     ${skipped.length ? `<details><summary>Skipped rows</summary><p class="muted">${skipped.slice(0, 50).map((s) => `row ${s.row}: ${esc(s.reason)}`).join(' · ')}${skipped.length > 50 ? ' …' : ''}</p></details>` : ''}
   </section>
   ${records.length && !missing.length ? `
   <form method="post" action="/upload/${pending.id}/import" class="card stack">
     <input type="hidden" name="header_row" value="${headerRow}">
     ${Object.entries(mapping).map(([k, v]) => `<input type="hidden" name="col_${k}" value="${v}">`).join('')}
-    ${kind === 'outstanding' ? `<p>This replaces the current outstanding data with this file.</p>` : '<p>Receipts already imported earlier are skipped automatically.</p>'}
-    <button class="btn">Import ${records.length} ${kind === 'outstanding' ? 'bills' : 'receipts'}</button>
+    <p>${importNote(kind, range)}</p>
+    <button class="btn">Import ${records.length} ${KINDS[kind].noun}</button>
   </form>` : ''}`;
   res.send(layout({ title: 'Check upload', user: req.user, active: '/upload', body }));
 });
+
+function dateRange(records) {
+  let from = records[0].bill_date, to = from;
+  for (const r of records) { if (r.bill_date < from) from = r.bill_date; if (r.bill_date > to) to = r.bill_date; }
+  return { from, to };
+}
+
+function importNote(kind, range) {
+  if (kind === 'outstanding') return 'This replaces the current buyers’ outstanding with this file.';
+  if (kind === 'payables') return 'This replaces the current suppliers’ outstanding with this file.';
+  if (kind === 'receipts') return 'Receipts already imported earlier are skipped automatically.';
+  return `Any ${kind} already uploaded for ${dmy(range.from)} to ${dmy(range.to)} will be replaced by this file.`;
+}
+
+function previewTable(kind, preview) {
+  if (kind === 'outstanding' || kind === 'payables') {
+    return `<thead><tr><th>${kind === 'payables' ? 'Supplier' : 'Buyer'}</th><th>Bill no.</th><th>Bill date</th><th class="num">Bill amt</th><th class="num">Pending</th></tr></thead>
+      <tbody>${preview.map((r) => `<tr><td>${esc(r.party_name)}</td><td>${esc(r.bill_no)}</td><td>${dmy(r.bill_date)}</td><td class="num">${r.bill_amount !== null ? rs(r.bill_amount) : ''}</td><td class="num">${rs(r.balance)}</td></tr>`).join('')}</tbody>`;
+  }
+  if (kind === 'receipts') {
+    return `<thead><tr><th>Date</th><th>Buyer</th><th>Voucher</th><th class="num">Amount</th><th>Mode</th></tr></thead>
+      <tbody>${preview.map((r) => `<tr><td>${dmy(r.receipt_date)}</td><td>${esc(r.party_name)}</td><td>${esc(r.voucher_no)}</td><td class="num">${rs(r.amount)}</td><td>${esc(r.mode)}</td></tr>`).join('')}</tbody>`;
+  }
+  return `<thead><tr><th>Date</th><th>Bill no.</th><th>${kind === 'purchase' ? 'Supplier' : 'Buyer'}</th><th>Item</th><th>Brand</th><th class="num">Qty</th><th class="num">Rate</th><th class="num">Value</th></tr></thead>
+    <tbody>${preview.map((r) => `<tr><td>${dmy(r.bill_date)}</td><td>${esc(r.bill_no)}</td><td>${esc(r.party_name)}</td><td>${esc(r.item)}</td><td>${esc(r.brand)}</td>
+      <td class="num">${r.qty ?? ''}</td><td class="num">${r.rate !== null ? rs(r.rate) : ''}</td><td class="num">${rs(r.amount)}</td></tr>`).join('')}</tbody>`;
+}
 
 function colLetter(i) {
   let s = '';
@@ -181,6 +220,7 @@ router.post('/upload/:id/import', express.urlencoded({ extended: false }), async
 
   const client = await pool.connect();
   let imported = 0;
+  let replaced = 0;
   try {
     await client.query('BEGIN');
     const { rows: u } = await client.query(
@@ -189,7 +229,7 @@ router.post('/upload/:id/import', express.urlencoded({ extended: false }), async
       [kind, pending.filename, todayIST(), skipped.length, req.user]);
     const uploadId = u[0].id;
 
-    if (kind === 'outstanding') {
+    if (SNAPSHOT_KINDS[kind]) {
       await client.query(
         `INSERT INTO outstanding_bills (upload_id, party_key, party_name, bill_no, bill_date, bill_amount, balance, marg_due_date)
          SELECT $1, * FROM unnest($2::text[], $3::text[], $4::text[], $5::date[], $6::numeric[], $7::numeric[], $8::date[])`,
@@ -199,8 +239,23 @@ router.post('/upload/:id/import', express.urlencoded({ extended: false }), async
       // Keep older snapshots for a while, then drop their bill rows.
       await client.query(
         `DELETE FROM outstanding_bills WHERE upload_id IN (
-           SELECT id FROM uploads WHERE kind = 'outstanding' AND id <> $1
-             AND uploaded_at < now() - ($2 || ' days')::interval)`, [uploadId, String(KEEP_SNAPSHOT_DAYS)]);
+           SELECT id FROM uploads WHERE kind = $3 AND id <> $1
+             AND uploaded_at < now() - ($2 || ' days')::interval)`, [uploadId, String(KEEP_SNAPSHOT_DAYS), kind]);
+    } else if (REGISTER_KINDS.includes(kind)) {
+      // The file is the truth for its dates: clear them, then insert.
+      const range = dateRange(records);
+      const del = await client.query(
+        'DELETE FROM register_lines WHERE register = $1 AND bill_date BETWEEN $2 AND $3',
+        [kind, range.from, range.to]);
+      replaced = del.rowCount;
+      await client.query(
+        `INSERT INTO register_lines (register, upload_id, bill_date, bill_no, party_key, party_name, item, brand, qty, mrp, rate, amount, tax, total)
+         SELECT $1, $2, * FROM unnest($3::date[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[],
+           $9::numeric[], $10::numeric[], $11::numeric[], $12::numeric[], $13::numeric[], $14::numeric[])`,
+        [kind, uploadId, col(records, 'bill_date'), col(records, 'bill_no'), col(records, 'party_key'), col(records, 'party_name'),
+          col(records, 'item'), col(records, 'brand'), col(records, 'qty'), col(records, 'mrp'), col(records, 'rate'),
+          col(records, 'amount'), col(records, 'tax'), col(records, 'total')]);
+      imported = records.length;
     } else {
       const r = await client.query(
         `INSERT INTO receipts (upload_id, party_key, party_name, receipt_date, voucher_no, amount, mode, narration)
@@ -219,7 +274,7 @@ router.post('/upload/:id/import', express.urlencoded({ extended: false }), async
   } finally {
     client.release();
   }
-  await ensureParties(records);
+  await ensureParties(records, kind === 'payables' || kind === 'purchase' ? 'payable' : 'receivable');
 
   // Remember the header names so tomorrow's file maps itself.
   const headers = rows[headerRow] || [];
@@ -228,10 +283,16 @@ router.post('/upload/:id/import', express.urlencoded({ extended: false }), async
   await setSetting(`mapping_${kind}`, JSON.stringify({ fields }));
 
   const dupes = kind === 'receipts' ? records.length - imported : 0;
-  const msg = kind === 'outstanding'
-    ? `Imported ${imported} pending bills. Reports now show this file.`
-    : `Imported ${imported} new receipts${dupes ? ` (${dupes} already there, skipped)` : ''}.`;
-  const next = kind === 'outstanding' ? '/' : '/collections';
+  const MSG = {
+    outstanding: `Imported ${imported} pending bills. Reports now show this file.`,
+    payables: `Imported ${imported} supplier bills. Payables now show this file.`,
+    receipts: `Imported ${imported} new receipts${dupes ? ` (${dupes} already there, skipped)` : ''}.`,
+    sales: `Imported ${imported} sales lines${replaced ? ` (replaced ${replaced} lines previously uploaded for these dates)` : ''}.`,
+    purchase: `Imported ${imported} purchase lines${replaced ? ` (replaced ${replaced} lines previously uploaded for these dates)` : ''}.`,
+  };
+  const NEXT = { outstanding: '/', payables: '/payables', receipts: '/collections', sales: '/sales', purchase: '/purchase' };
+  const msg = MSG[kind];
+  const next = NEXT[kind];
   res.send(layout({ title: 'Imported', user: req.user, active: '/upload',
     flash: { type: 'ok', html: esc(msg) },
     body: `<p><a class="btn" href="${next}">See reports</a> <a class="btn ghost" href="/upload">Upload another file</a></p>` }));

@@ -8,17 +8,20 @@ const router = express.Router();
 
 router.get('/settings', async (req, res) => {
   const days = await defaultCreditDays();
+  const vdays = await defaultCreditDays('payable');
+  const { rows: vendors } = await pool.query('SELECT * FROM vendors ORDER BY display_name');
   const { rows: parties } = await pool.query(
     'SELECT * FROM parties ORDER BY display_name');
   const saved = req.query.saved ? { type: 'ok', html: 'Saved.' } : null;
   const body = `
   <h1>Settings</h1>
   <section class="card">
-    <h2>Default credit period</h2>
-    <p class="muted">Used for any buyer who has no credit days of their own. Due date = bill date + credit days.</p>
-    <form method="post" action="/settings" class="inline">
-      <input type="number" name="default_credit_days" min="0" max="365" value="${days}" required> days
-      <button class="btn">Save</button>
+    <h2>Default credit periods</h2>
+    <p class="muted">Used for anyone without credit days of their own. Due date = bill date + credit days.</p>
+    <form method="post" action="/settings" class="form-grid">
+      <label>Buyers (what they get from us)<span class="inline"><input type="number" name="default_credit_days" min="0" max="365" value="${days}" required> days</span></label>
+      <label>Suppliers (what we get from them)<span class="inline"><input type="number" name="default_vendor_credit_days" min="0" max="365" value="${vdays}" required> days</span></label>
+      <div class="wide"><button class="btn">Save</button></div>
     </form>
   </section>
   <section class="card">
@@ -32,6 +35,15 @@ router.get('/settings', async (req, res) => {
         <td class="num">${p.credit_days ?? `<span class="muted">${days}</span>`}</td>
         <td class="num">${p.credit_limit ? rs(p.credit_limit) : '<span class="muted">–</span>'}</td>
         <td>${esc(p.phone)}</td><td>${esc(p.salesman)}</td></tr>`).join('')}</tbody>
+    </table></div>
+  </section>
+  <section class="card">
+    <h2>Suppliers (${vendors.length})</h2>
+    <p class="muted">Added automatically from purchase and creditors uploads. Open one to set its credit days.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Supplier</th><th class="num">Credit days</th><th>Mobile</th></tr></thead>
+      <tbody>${vendors.map((v) => `<tr><td><a href="/vendor/${encodeURIComponent(v.party_key)}#edit">${esc(v.display_name)}</a></td>
+        <td class="num">${v.credit_days ?? `<span class="muted">${vdays}</span>`}</td><td>${esc(v.phone)}</td></tr>`).join('')}</tbody>
     </table></div>
   </section>
   <section class="card">
@@ -51,8 +63,10 @@ router.get('/settings', async (req, res) => {
 });
 
 router.post('/settings', express.urlencoded({ extended: false }), async (req, res) => {
-  const n = parseInt(req.body.default_credit_days, 10);
-  if (Number.isFinite(n) && n >= 0 && n <= 365) await setSetting('default_credit_days', n);
+  for (const key of ['default_credit_days', 'default_vendor_credit_days']) {
+    const n = parseInt(req.body[key], 10);
+    if (Number.isFinite(n) && n >= 0 && n <= 365) await setSetting(key, n);
+  }
   res.redirect('/settings?saved=1');
 });
 

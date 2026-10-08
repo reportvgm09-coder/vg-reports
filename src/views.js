@@ -27,9 +27,12 @@ function dmy(iso) {
 const NAV = [
   ['/', 'Dashboard'],
   ['/followup', 'Follow-up'],
-  ['/outstanding', 'Outstanding'],
-  ['/bills', 'Bill ageing'],
+  ['/outstanding', 'Receivables'],
   ['/collections', 'Collections'],
+  ['/sales', 'Sales'],
+  ['/orders', 'Orders'],
+  ['/purchase', 'Purchase'],
+  ['/payables', 'Payables'],
   ['/upload', 'Upload'],
   ['/settings', 'Settings'],
 ];
