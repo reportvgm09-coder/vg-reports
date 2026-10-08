@@ -6,3 +6,6 @@ node_modules/
 *.xls
 *.xlsx
 *.csv
+# local database and secrets (this computer only)
+data/
+demo-files/

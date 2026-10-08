@@ -1,6 +1,7 @@
+require('./env');
 const path = require('path');
 const express = require('express');
-const { migrate } = require('./db');
+const { migrate, LOCAL, DATA_DIR } = require('./db');
 const auth = require('./auth');
 const { layout, esc } = require('./views');
 
@@ -69,8 +70,25 @@ app.use((err, req, res, next) => {
 });
 
 const port = process.env.PORT || 3000;
+// On your own computer, only this computer can open the app.
+const host = LOCAL ? (process.env.HOST || '127.0.0.1') : '0.0.0.0';
 (async () => {
-  if (!auth.users().length) console.warn('APP_USERS is empty: nobody can log in yet.');
+  if (!auth.users().length) console.warn('APP_USERS is empty: nobody can log in yet. Run start-app again to set a login.');
   await migrate();
-  app.listen(port, () => console.log(`VG Reports running on port ${port}`));
-})().catch((e) => { console.error(e); process.exit(1); });
+  app.listen(port, host, () => {
+    if (LOCAL) {
+      console.log('');
+      console.log('  VG Reports is running on this computer.');
+      console.log(`  Open:  http://localhost:${port}`);
+      console.log(`  Data:  ${DATA_DIR}`);
+      console.log('  Close this window to stop it.');
+      console.log('');
+    } else {
+      console.log(`VG Reports running on port ${port}`);
+    }
+  });
+})().catch((e) => {
+  console.error(e);
+  if (LOCAL && /lock|EBUSY|already/i.test(String(e.message))) console.error('Is VG Reports already open in another window? Close it and try again.');
+  process.exit(1);
+});

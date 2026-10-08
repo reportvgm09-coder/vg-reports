@@ -61,20 +61,29 @@ Customers are matched to Marg buyers by name (also "name + city"). Any that don'
 
 **Database plan:** the blueprint starts on Render's free database plan. Render's free databases have time and size limits (check Render's current terms); move the database to a paid plan before relying on it, or the data can be lost. The free web service also sleeps when idle, so the first page after a quiet spell takes a little longer.
 
-## Running locally
-```
-cp .env.example .env        # fill in a local Postgres URL
-npm install
-node --env-file=.env src/server.js
-npm test
-```
+## Running on your own computer (development)
+
+No database to install: on your computer the app keeps its data in a `data` folder beside it. Only your computer can open it.
+
+1. Install **Node.js LTS** from https://nodejs.org (one time).
+2. Get this code: on GitHub, **Code → Download ZIP** and unzip it (e.g. to `Documents\vg-reports`), or clone it with GitHub Desktop so updates are one click.
+3. Double-click **`start-app.bat`** (Mac: `start-app.sh`). The first time it installs what it needs and asks you to choose a login name and password. Your browser then opens **http://localhost:3000**.
+4. To try every report before your real Marg files are ready, double-click **`make-demo-files.bat`**. It makes five made-up Marg-style Excel files in `demo-files`; upload each on the Upload page.
+
+To stop the app, close its window. To change the login, double-click **`set-login.bat`**. To start again from empty, close the app and delete the `data` folder.
+
+For the Orders page, put the read-only connection string (see above) after `ORDERS_MONGO_URL=` in the `.env` file, then restart.
+
+Developers: `npm install`, then `npm run local` (or `npm run dev` to restart on code changes) and `npm test`. With `DATABASE_URL` set, the app uses that PostgreSQL server instead of the `data` folder.
 
 ## Code map
 - `src/excel.js`: reads Marg Excel (.xls/.xlsx/.csv), finds the header row, matches columns, handles grouped layouts, Indian dates and `Dr`/`Cr` amounts
 - `src/ageing.js`: due dates, buckets, party roll-up (used for both receivables and payables)
 - `src/orders.js`: read-only Sales Order database access and its order maths
 - `src/routes/`: pages (`reports` receivables/collections/buyer, `payables`, `registers` sales/purchase, `orders`, `upload`, `settings`)
+- `src/db.js`: PostgreSQL on Render, or the built-in database (PGlite) in `data/` on your computer
 - `src/schema.sql`: tables, created/updated automatically on start
+- `scripts/`: first-run login setup, demo-file maker, starter checks
 - `test/`: unit tests (`npm test`)
 
 ## Notes
