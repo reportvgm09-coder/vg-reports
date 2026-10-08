@@ -1,0 +1,8 @@
+node_modules/
+.env
+*.log
+.DS_Store
+# never commit real Marg exports
+*.xls
+*.xlsx
+*.csv

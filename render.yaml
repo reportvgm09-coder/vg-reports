@@ -1,0 +1,29 @@
+# Render blueprint: creates the web app and its own PostgreSQL database.
+# Render dashboard → New → Blueprint → pick this repo.
+services:
+  - type: web
+    name: vg-reports
+    runtime: node
+    region: singapore
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: vg-reports-db
+          property: connectionString
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: APP_USERS          # e.g. owner:StrongPass1,accounts:StrongPass2
+        sync: false
+
+databases:
+  - name: vg-reports-db
+    region: singapore
+    plan: free                  # see README: upgrade before relying on it
+    databaseName: vg_reports
+    user: vg_reports
